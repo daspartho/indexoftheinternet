@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>index of the internet</title>
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#fff;color:#1d1d1f;font:13px -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}
+canvas{position:fixed;top:0;left:0;display:block;cursor:grab;touch-action:none}
+canvas.drag{cursor:grabbing}
+canvas.link{cursor:pointer}
+/* the sheet ends at a plain bar: the place in the middle of the sheet on the left, its two numbers on the right (across, then down); all editable */
+#bar{position:fixed;left:0;right:0;bottom:0;height:44px;box-sizing:border-box;display:flex;align-items:center;justify-content:space-between;gap:12px;
+  padding:0 12px;background:#fff;border-top:1px solid #ccc}
+#go{min-width:0;flex:0 1 auto}
+#bar span{white-space:nowrap}
+#go.bad::placeholder{color:#d93025}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<div id="bar"><input id="go" size="40" spellcheck="false" autocomplete="off" autocapitalize="off" aria-label="place"><span><input id="col" size="5" inputmode="numeric" autocomplete="off" aria-label="across">, <input id="row" size="16" inputmode="numeric" autocomplete="off" aria-label="down"></span></div>
+<script type="module">
+// Every place anyone could claim on the internet: every possible name under every ending.
+// Rows: every possible name in order, shorter first, then alphabetical, going down to the last 63-character name.
+// Columns: the endings (top-level domains) in alphabetical order, wrapping around.
+
+// ---- names ----
+// A name has 1 to 63 characters from a-z, 0-9 and hyphen; no hyphen first or last, and no hyphens in
+// places 3 and 4 unless it starts with "xn" (that pattern is reserved for international names).
+const A = 'abcdefghijklmnopqrstuvwxyz0123456789-', MAXLEN = 63;
+const possible = n => n.length >= 1 && n.length <= MAXLEN && /^[a-z0-9-]+$/.test(n) && n[0] !== '-' && n[n.length - 1] !== '-' &&
+  !(n.length >= 4 && n[2] === '-' && n[3] === '-' && !n.startsWith('xn'));
+// How many possible names of length L start with p. Used to number the names with no gaps.
+const choices = (i, L) => (i === 0 || i === L - 1 ? 36n : 37n);    // the first and last place can't be a hyphen
+function count(p, L) {
+  const k = p.length;
+  if (k > 0 && p[0] === '-') return 0n;
+  if (k === L) return possible(p) ? 1n : 0n;
+  let total = 1n;
+  for (let i = k; i < L; i++) total *= choices(i, L);
+  if (L >= 5 && !(k > 2 && p[2] !== '-') && !(k > 3 && p[3] !== '-')) {
+    // take away completions with hyphens in places 3 and 4, except those starting "xn"
+    let both = 1n;
+    for (let i = k; i < L; i++) if (i !== 2 && i !== 3) both *= choices(i, L);
+    const xn = k >= 2 ? (p[0] === 'x' && p[1] === 'n' ? both : 0n)
+             : k === 1 ? (p[0] === 'x' ? both / choices(1, L) : 0n)
+             : both / (choices(0, L) * choices(1, L));
+    total -= both - xn;
+  }
+  return total;
+}
+const OF_LENGTH = [0n];                                   // OF_LENGTH[L] = how many possible names have length L
+for (let L = 1; L <= MAXLEN; L++) OF_LENGTH[L] = count('', L);
+const firstRowOf = L => { let r = 0n; for (let k = 1; k < L; k++) r += OF_LENGTH[k]; return r; };
+const ROWS = firstRowOf(MAXLEN + 1);                      // how many names there are in all
+function rowOf(n) {
+  let r = firstRowOf(n.length);
+  for (let i = 0; i < n.length; i++) for (const c of A) { if (c === n[i]) break; r += count(n.slice(0, i) + c, n.length); }
+  return r;
+}
+function nameAt(r) {
+  let L = 1;
+  while (r >= OF_LENGTH[L]) { r -= OF_LENGTH[L]; L++; }
+  let p = '';
+  for (let i = 0; i < L; i++) for (const c of A) { const k = count(p + c, L); if (r < k) { p += c; break; } r -= k; }
+  return p;
+}
+
+// ---- endings ----
+// The official list of endings, from IANA.
+let endingsText;
+try { endingsText = await (await fetch('https://data.iana.org/TLD/tlds-alpha-by-domain.txt')).text(); }
+catch { document.body.textContent = 'could not reach iana.org for the list of endings. try again when you are online.'; throw 0; }
+const ENDINGS = endingsText.split('\n').map(l => l.trim().toLowerCase()).filter(l => l && !l.startsWith('#'));
+const E = BigInt(ENDINGS.length);
+const wrap = x => Number(((x % E) + E) % E);
+const endingAt = x => ENDINGS[wrap(x)];
+
+// ---- is anyone there: DNS, asked from the page through two public services in turn ----
+const live = new Map();                                   // 'name.ending' -> true (someone is there) | false
+let turn = 0, pauseUntil = 0;
+const dns = (h, type) => (turn++ % 2
+  ? fetch(`https://dns.google/resolve?name=${h}&type=${type}`)
+  : fetch(`https://cloudflare-dns.com/dns-query?name=${h}&type=${type}`, { headers: { accept: 'application/dns-json' } })
+).then(r => { if (r.status === 429) { pauseUntil = Date.now() + 2000; throw 0; } if (!r.ok) throw 0; return r.json(); });
+const has = (j, type) => (j.Answer || []).some(a => a.type === type);
+// Some endings answer for every name, taken or not. Each ending is tested once with a nonsense name;
+// under those, only a name with its own nameservers counts as someone being there.
+const answersAll = new Map();
+const isWildcard = t => {
+  if (!answersAll.has(t)) {
+    const nonsense = Array.from(crypto.getRandomValues(new Uint8Array(24)), b => A[b % 26]).join('');
+    answersAll.set(t, dns(nonsense + '.' + t, 'A').then(j => j.Status === 0 && (j.Answer || []).length > 0, () => false));
+  }
+  return answersAll.get(t);
+};
+// DNS answer codes: 0 = an answer, 3 = no such name, 2 = the name exists but its servers don't respond.
+// 2 and 3 both mean no one to visit; anything else is unclear and is asked again later.
+const clear = j => j.Status === 0 || j.Status === 2 || j.Status === 3;
+async function check(h) {
+  try {
+    let there;
+    if (await isWildcard(h.slice(h.lastIndexOf('.') + 1))) {
+      const j = await dns(h, 'NS');
+      if (!clear(j)) throw 0;
+      there = j.Status === 0 && has(j, 2);
+    } else {
+      // someone is there if the name leads to an address: IPv4 (A) or, failing that, IPv6 (AAAA)
+      const a = await dns(h, 'A');
+      if (!clear(a)) throw 0;
+      there = a.Status === 0 && has(a, 1);
+      if (!there && a.Status === 0) { const b = await dns(h, 'AAAA'); there = b.Status === 0 && has(b, 28); }
+    }
+    live.set(h, there);
+    redraw();
+  } catch { failed.set(h, Date.now()); }
+}
+const asking = new Set(), failed = new Map();             // failed: when a name last got no clear answer
+let active = 0, wanted = [];                              // wanted: places on and around the screen, nearest the middle first
+function ask() {
+  if (Date.now() < pauseUntil) { setTimeout(ask, pauseUntil - Date.now()); return; }
+  for (const c of wanted) {
+    if (active >= 40) break;
+    if (live.has(c.h) || asking.has(c.h) || Date.now() - (failed.get(c.h) || 0) < 30000) continue;   // retry after 30 s
+    active++; asking.add(c.h);
+    check(c.h).finally(() => { active--; asking.delete(c.h); ask(); });
+  }
+}
+let askT = 0;
+const askSoon = () => { if (!askT) askT = setTimeout(() => { askT = 0; ask(); }, 40); };   // starts even while moving
+
+// ---- the sheet ----
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d', { alpha: false });     // a solid canvas keeps text crisp
+const goEl = document.getElementById('go'), rowEl = document.getElementById('row'), colEl = document.getElementById('col');
+const FONT = '15px ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace';
+const ROW = 34, BASELINE = 22, BAR = 45, ABOVE = 2;        // ABOVE: empty rows above the first name
+const height = () => innerHeight - BAR;                   // the sheet ends where the bar begins
+let dpr = 1, CHW = 9;                                     // CHW: width of one character, on whole device pixels
+// Each character sits on its own whole-pixel slot, so every letter is equally sharp.
+function write(str, x, y) { for (let i = 0; i < str.length; i++) ctx.fillText(str[i], x + i * CHW, y); }
+// Links you have opened turn purple, as on any web page.
+const visited = new Set(JSON.parse(localStorage.getItem('index.visited') || '[]'));
+
+// The view: camY = row at the top, fy = pixels into it; camX = column at the left, fx = fraction (0..1) into it.
+let camX = 0n, camY = 0n, fx = 0, fy = 0;
+const names = new Map();                                  // row -> name
+function nameAtRow(y) {
+  if (y < 0n || y >= ROWS) return null;                   // above the first name or past the last: nothing
+  let n = names.get(y);
+  if (n === undefined) { n = nameAt(y); names.set(y, n); if (names.size > 20000) names.delete(names.keys().next().value); }
+  return n;
+}
+// Every column has room for the name in the middle of the screen plus one letter, its ending, and two characters of gap.
+// Only two lengths are ever on screen at once, so the next length already fits; the room grows or shrinks only when
+// the boundary between lengths crosses the middle of the screen, keeping the middle column where it is.
+let room = 2;
+const colW = x => (room + 1 + endingAt(x).length + 2) * CHW;
+const middleRow = () => camY + BigInt(Math.floor((height() / 2 + fy) / ROW));
+// Put the left edge of the view `px` pixels into column camX, carrying into neighbouring columns as needed.
+function setAcross(px) {
+  while (px >= colW(camX)) { px -= colW(camX); camX++; }
+  while (px < 0) { camX--; px += colW(camX); }
+  fx = px / colW(camX);
+}
+function cellAt(px, py) {
+  const y = camY + BigInt(Math.floor((py + fy) / ROW));
+  let x = camX, left = -fx * colW(camX);
+  while (left + colW(x) <= px) { left += colW(x); x++; }
+  return { x, y, left };
+}
+
+function resize() {
+  dpr = devicePixelRatio || 1;
+  cv.width = Math.round(innerWidth * dpr); cv.height = Math.round(height() * dpr);
+  cv.style.width = innerWidth + 'px'; cv.style.height = height() + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.font = FONT;
+  CHW = Math.round(ctx.measureText('m').width * dpr) / dpr;
+  redraw();
+}
+let frameId = 0;
+const redraw = () => { if (!frameId) frameId = requestAnimationFrame(() => { frameId = 0; draw(); }); };
+function draw() {
+  const snap = v => Math.round(v * dpr) / dpr;           // whole device pixels
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, innerWidth, height());
+  ctx.font = FONT;
+  const rows = Math.ceil((height() + fy) / ROW) + 1, mx = innerWidth / 2, my = height() / 2;
+  const mid = cellAt(mx, my);
+  wanted = [];
+  let lastX = camX;
+  for (let r = 0; r < rows; r++) {
+    const y = camY + BigInt(r), n = nameAtRow(y);
+    if (n === null) continue;
+    const py = snap(r * ROW - fy);
+    for (let x = camX, left = -fx * colW(camX); left < innerWidth; left += colW(x), x++) {
+      lastX = x;
+      const h = n + '.' + endingAt(x), px = snap(left), there = live.get(h);
+      // Like any page of text: black. Someone there: a link, blue and underlined, purple once visited.
+      // Not asked yet: grey.
+      ctx.fillStyle = there === true ? (visited.has(h) ? '#551a8b' : '#0000ee') : there === false ? '#1d1d1f' : '#c7c7cc';
+      write(h, px, py + BASELINE);
+      if (there === true) ctx.fillRect(px, py + BASELINE + 3, h.length * CHW, 1);
+      wanted.push({ h, dist: (px - mx) ** 2 + (py - my) ** 2 });
+    }
+  }
+  // Also ask about a screen above and below and three endings either side, so places are ready before you get there.
+  for (let x = camX - 3n; x <= lastX + 3n; x++) {
+    const t = endingAt(x), dx = Number(x - mid.x) * 140;
+    for (let r = -rows; r < 2 * rows; r++) {
+      if (r >= 0 && r < rows && x >= camX && x <= lastX) continue;
+      const y = camY + BigInt(r), n = nameAtRow(y);
+      if (n === null) continue;
+      const dy = Number(y - mid.y) * ROW;
+      wanted.push({ h: n + '.' + t, dist: dx * dx + dy * dy + 1e6 });
+    }
+  }
+  wanted.sort((a, b) => a.dist - b.dist);
+  // The bar shows the place in the middle of the sheet and its two numbers: across (which ending), then down (which name).
+  // Fields being edited are left alone.
+  const mn = nameAtRow(mid.y);
+  if (document.activeElement !== goEl && !goEl.classList.contains('bad')) goEl.value = mn ? mn + '.' + endingAt(mid.x) : '';
+  if (document.activeElement !== colEl) colEl.value = mn ? wrap(mid.x) + 1 : '';
+  if (document.activeElement !== rowEl) rowEl.value = mn ? (mid.y + 1n).toString() : '';
+  askSoon();
+}
+
+function pan(dx, dy) {
+  fy += dy;
+  const ky = Math.floor(fy / ROW);
+  camY += BigInt(ky); fy -= ky * ROW;
+  const top = -BigInt(ABOVE), bottom = ROWS - 1n - BigInt(Math.floor(height() / 2 / ROW));   // stop with the last name mid-screen
+  if (camY < top) { camY = top; fy = 0; }
+  if (camY > bottom) { camY = bottom; fy = 0; }
+  const want = (nameAtRow(middleRow()) || 'a').length + 1;
+  if (want !== room) {                                    // a boundary crossed the middle: resize around the middle column
+    const c = cellAt(innerWidth / 2, 0);
+    room = want; camX = c.x; setAcross(-c.left);
+  }
+  setAcross(fx * colW(camX) + dx);
+  redraw();
+}
+function goRow(y, x) {
+  if (y < 0n) y = 0n;
+  if (y >= ROWS) y = ROWS - 1n;
+  camY = y - BigInt(Math.floor(height() / 2 / ROW)); fy = 0;
+  if (camY < -BigInt(ABOVE)) camY = -BigInt(ABOVE);
+  room = nameAtRow(y).length + 1;
+  camX = x; setAcross(colW(x) / 2 - innerWidth / 2);     // that place in the middle
+  redraw();
+}
+const randomBig = bytes => { let r = 0n; for (const b of crypto.getRandomValues(new Uint8Array(bytes))) r = (r << 8n) | BigInt(b); return r; };
+
+// ---- search ----
+// Typing an address goes there.
+function go(v) {
+  v = v.trim().toLowerCase();
+  // Let the browser read it as a web address: this handles capitals, ports, paths, a trailing dot,
+  // and turns names in other scripts (münchen.de) into the form DNS uses (xn--mnchen-3ya.de).
+  let host;
+  try { host = new URL(/^[a-z][a-z0-9+.-]*:\/\//.test(v) ? v : 'https://' + v.replace(/\s+/g, '')).hostname.replace(/\.$/, ''); }
+  catch { return false; }
+  let labels = host.split('.');
+  if (labels[0] === 'www' && labels.length > 2) labels = labels.slice(1);
+  if (labels.length === 1) labels.push('com');            // just a name: .com
+  // Deeper addresses (blog.partho.world) go to the place they belong to (partho.world).
+  const [s, t] = labels.slice(-2);
+  if (!possible(s) || !ENDINGS.includes(t)) return false;
+  goRow(rowOf(s), BigInt(ENDINGS.indexOf(t)));
+  return true;
+}
+let noteT;
+function note(el, text) {
+  el.value = ''; el.placeholder = text; el.classList.add('bad'); clearTimeout(noteT);
+  noteT = setTimeout(() => { el.placeholder = ''; el.classList.remove('bad'); redraw(); }, 2500);
+}
+goEl.addEventListener('keydown', e => {
+  e.stopPropagation();
+  if (e.key === 'Escape') { goEl.blur(); redraw(); return; }
+  if (e.key !== 'Enter') return;
+  const ok = go(goEl.value);
+  goEl.blur();
+  if (!ok) note(goEl, "that place can't exist");
+  redraw();
+});
+// Typing the two numbers goes there: across = which ending (1 onwards, wrapping around), down = which name (1 = the first).
+for (const el of [rowEl, colEl]) el.addEventListener('keydown', e => {
+  e.stopPropagation();
+  if (e.key === 'Escape') { el.blur(); redraw(); return; }
+  if (e.key !== 'Enter') return;
+  const r = rowEl.value.replace(/\D/g, ''), c = colEl.value.replace(/\D/g, '');
+  if (r && c && BigInt(r) >= 1n && BigInt(c) >= 1n) goRow(BigInt(r) - 1n, BigInt(c) - 1n);
+  el.blur(); redraw();
+});
+for (const el of [goEl, rowEl, colEl]) el.addEventListener('focus', () => el.select());
+
+// ---- moving around: mouse, pen and touch alike ----
+let down = null, moved = false;
+cv.addEventListener('pointerdown', e => { down = { x: e.clientX, y: e.clientY, id: e.pointerId }; moved = false; cv.setPointerCapture(e.pointerId); });
+cv.addEventListener('pointermove', e => {
+  if (down && e.pointerId === down.id) {
+    const dx = e.clientX - down.x, dy = e.clientY - down.y;
+    if (Math.abs(dx) + Math.abs(dy) > 3) moved = true;
+    if (moved) { cv.classList.add('drag'); pan(-dx, -dy); down.x = e.clientX; down.y = e.clientY; }
+    return;
+  }
+  const c = cellAt(e.clientX, e.clientY), n = nameAtRow(c.y);
+  cv.classList.toggle('link', n !== null && live.get(n + '.' + endingAt(c.x)) === true);
+});
+cv.addEventListener('pointerup', e => {
+  cv.classList.remove('drag');
+  if (down && !moved) {                                   // a click or tap, not a drag: open the place if someone is there
+    const c = cellAt(e.clientX, e.clientY), n = nameAtRow(c.y), h = n && n + '.' + endingAt(c.x);
+    if (h && live.get(h) === true) {
+      visited.add(h); localStorage.setItem('index.visited', JSON.stringify([...visited])); redraw();
+      open('https://' + h + '/', '_blank', 'noopener');
+    }
+  }
+  down = null;
+});
+cv.addEventListener('pointercancel', () => { cv.classList.remove('drag'); down = null; });
+cv.addEventListener('wheel', e => {
+  e.preventDefault();
+  if (e.ctrlKey) return;                                  // a pinch on a trackpad: no zooming, nothing happens
+  const unit = e.deltaMode === 1 ? ROW : e.deltaMode === 2 ? height() : 1;   // some mice scroll by lines or pages
+  pan(e.deltaX * unit, e.deltaY * unit);
+}, { passive: false });
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  // Pasting anywhere: move to the address box first, so the browser pastes straight into it.
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'v') { goEl.value = ''; goEl.focus(); return; }
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const k = { ArrowLeft: [-colW(camX - 1n) * 4, 0], ArrowRight: [colW(camX) * 4, 0], ArrowUp: [0, -ROW * 4], ArrowDown: [0, ROW * 4] }[e.key];
+  if (k) { e.preventDefault(); pan(...k); return; }
+  if (e.key.length === 1 && e.key !== ' ') { e.preventDefault(); goEl.focus(); goEl.value = e.key; }   // typing anywhere starts a new address
+});
+addEventListener('resize', resize);
+
+// Open somewhere random: any ending, and a name of 1 to 6 characters, the lengths where people live
+// (in a sample of 400 random 7-letter .com names, none was registered).
+resize();
+{
+  const L = 1 + Number(randomBig(4) % 6n);
+  goRow(firstRowOf(L) + randomBig(16) % OF_LENGTH[L], randomBig(4) % E);
+}
+</script>
+</body>
+</html>
